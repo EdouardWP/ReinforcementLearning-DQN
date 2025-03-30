@@ -1,0 +1,32 @@
+# Virtual Environment
+rl/
+venv/
+env/
+.env/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Keep required image files
+*.png
+!race_track_ie.png
+!car*.png
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log 
