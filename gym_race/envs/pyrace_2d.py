@@ -1,5 +1,6 @@
 import pygame
 import math
+import numpy as np
 
 screen_width = 1500
 screen_height = 800
@@ -31,10 +32,10 @@ class Car:
         self.prev_distance = 0
         self.cur_distance = 0
         self.check_flag = False
-        """
-        for d in range(-90, 120, 45): self.check_radar(d)
-        for d in range(-90, 105, 15): self.check_radar_for_draw(d)
-        """
+        
+        # Initialize radars
+        for d in range(-90, 120, 45):
+            self.check_radar(d)
 
     def draw(self, screen):
         screen.blit(self.rotate_surface, self.pos)
@@ -112,9 +113,9 @@ class Car:
 
     def update(self,map=None):
         #check speed
-        self.speed -= 0.5
+        self.speed -= 0.3  # Reduced friction for smoother deceleration
         if self.speed > 10: self.speed = 10
-        if self.speed < 1:  self.speed = 1
+        if self.speed < 0:  self.speed = 0  # Allow car to come to a complete stop
         
         # required for NEAT
         if map is not None:
@@ -193,7 +194,7 @@ class Car:
 
 
 class PyRace2D:
-    def __init__(self, is_render = True, car = True, mode = 0):
+    def __init__(self, is_render = True, car = True, mode = 0, continuous_radar=False):
         # print('PyRace2D - INIT ENVIRONMENT')
         pygame.init()
         self.screen = pygame.display.set_mode((screen_width, screen_height))
@@ -207,11 +208,20 @@ class PyRace2D:
         self.game_speed = 60*0 # as fast as possible...
         self.is_render = is_render
         self.mode = mode # 0: normal, 1:dark, 2: normal (force display)
+        self.continuous_radar = continuous_radar  # Flag for continuous radar values
 
     def action(self, action):
-        if action == 0: self.car.speed += 2
-        elif action == 1: self.car.angle += 5
-        elif action == 2: self.car.angle -= 5
+        # For discrete action space (compatibility with v1)
+        if isinstance(action, int):
+            if action == 0: self.car.speed += 2
+            elif action == 1: self.car.angle += 5
+            elif action == 2: self.car.angle -= 5
+            elif action == 3: self.car.speed -= 2  # New BRAKE action
+        # For continuous action space
+        elif isinstance(action, (list, tuple, np.ndarray)) and len(action) == 2:
+            # action[0]: acceleration (-1 to 1), action[1]: steering (-1 to 1)
+            self.car.speed += action[0] * 2  # Scale to similar range
+            self.car.angle += action[1] * 5  # Scale to similar range
 
         self.car.update()
         self.car.check_collision()
@@ -223,19 +233,39 @@ class PyRace2D:
 
     def evaluate(self):
         reward = 0
-        """
+        
+        # Check for checkpoint progress
         if self.car.check_flag:
             self.car.check_flag = False
-            reward = 2000 - self.car.time_spent
-            self.car.time_spent = 0
-        """
-        if not self.car.is_alive: # crash
-            reward = -10000 + self.car.distance
+            # Higher reward for reaching checkpoints quickly
+            reward += 200  # Increased checkpoint reward
+            
+        # Progressive reward based on distance to next checkpoint
+        current_checkpoint = check_point[self.car.current_check]
+        distance_to_checkpoint = get_distance(current_checkpoint, self.car.center)
+        
+        # Reward for getting closer to the next checkpoint - more aggressive rewards
+        if self.car.prev_distance > distance_to_checkpoint:
+            reward += 0.5 * (self.car.prev_distance - distance_to_checkpoint)  # 5x stronger reward
+        
+        # Penalty for moving away from checkpoint
+        elif self.car.prev_distance < distance_to_checkpoint:
+            reward -= 0.1 * (distance_to_checkpoint - self.car.prev_distance)
+        
+        # Stronger living bonus to encourage survival
+        reward += 0.1
 
-        elif self.car.goal:
-            # reward = 10000*(1+self.car.current_check)/len(check_point)
-            reward = 10000
-            # print('goal',self.car.current_check,len(check_point))
+        # Speed-based reward component (encourage moderate speed)
+        optimal_speed = 7
+        speed_reward = 1.0 - abs(self.car.speed - optimal_speed) / 10.0
+        reward += speed_reward * 0.5  # Increased speed reward importance
+            
+        # Failure cases
+        if not self.car.is_alive:  # crash
+            reward = -20  # Less severe crash penalty
+        elif self.car.goal:  # reached final checkpoint
+            reward = 1000  # Higher goal reward
+            
         return reward
 
     def is_done(self):
@@ -248,14 +278,25 @@ class PyRace2D:
     def observe(self):
         # return state
         radars = self.car.radars
-        # print('RADARS',radars)
-        ret = [0, 0, 0, 0, 0]
-        i = 0
-        for r in radars:
-            ret[i] = int(r[1] / 20)
-            i += 1
-
-        return ret
+        radar_values = []
+        
+        # Make sure we have 5 radar values
+        if len(radars) < 5:
+            # Initialize radars if they're empty
+            self.car.radars.clear()
+            for d in range(-90, 120, 45):
+                self.car.check_radar(d)
+            radars = self.car.radars
+        
+        for i, r in enumerate(radars):
+            if self.continuous_radar:
+                # Return actual distance values (normalized by 200, which is max radar length)
+                radar_values.append(r[1] / 200.0)
+            else:
+                # Original bucketed values (for backward compatibility)
+                radar_values.append(int(r[1] / 30))
+        
+        return radar_values
 
     def view_(self, msgs=[]): # RENDERING...
         # draw game
