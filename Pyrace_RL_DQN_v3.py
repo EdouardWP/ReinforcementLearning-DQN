@@ -13,63 +13,65 @@ from collections import namedtuple, deque
 import gymnasium as gym
 import gym_race
 
-VERSION_NAME = 'DQN_v03'
+VERSION_NAME = 'DQN_v03_opt'
 
-# Constants for training - smaller episodes for faster iterations
-REPORT_EPISODES = 100  # Reduced for more frequent updates
-DISPLAY_EPISODES = 50   # Reduced for performance
-NUM_EPISODES = 20_000   # Reduced total episodes
+# Constants for training - further optimized for faster convergence
+REPORT_EPISODES = 50  # More frequent updates
+DISPLAY_EPISODES = 25  # Less frequent display
+NUM_EPISODES = 5_000   # Far fewer episodes needed with optimizations
 MAX_T = 2000
 
-# DDPG specific parameters - optimized for faster learning
-BATCH_SIZE = 64     # Smaller batch for faster updates
-MEMORY_SIZE = 20000  # Larger memory for better experience diversity
-GAMMA = 0.99       # Discount factor
-TAU = 0.01         # Faster target network update rate
-ACTOR_LR = 3e-4    # Increased learning rate
-CRITIC_LR = 3e-3   # Increased learning rate
-NOISE_SIGMA = 0.1  # Reduced exploration noise for more stable actions
-UPDATE_EVERY = 2   # Update networks every N steps
+# DDPG specific parameters - hyper-optimized
+BATCH_SIZE = 128       # Larger batch size for better gradient estimates
+MEMORY_SIZE = 50000    # Much larger memory for better retention of rare experiences
+GAMMA = 0.99           # Discount factor
+TAU = 0.05             # Even faster target network update rate
+ACTOR_LR = 5e-4        # Further increased learning rate
+CRITIC_LR = 5e-3       # Further increased learning rate
+NOISE_SIGMA = 0.15     # Balanced exploration
+UPDATE_EVERY = 1       # Update on every step for faster learning
+PER_ALPHA = 0.7        # Prioritized experience replay exponent
+PER_BETA = 0.5         # Initial importance sampling weight
+N_STEP_RETURNS = 3     # Use n-step returns for faster credit assignment
 
 # Define transition tuple for memory management
 Transition = namedtuple('Transition',
-                       ('state', 'action', 'next_state', 'reward', 'done'))
+                       ('state', 'action', 'reward', 'next_state', 'done', 'priority'))
 
-# Optimized Ornstein-Uhlenbeck noise process
-class OUNoise:
-    """Ornstein-Uhlenbeck process for generating correlated noise"""
-    def __init__(self, action_dimension, mu=0, theta=0.2, sigma=0.1):
+# Optimized Gaussian noise process (simpler than OU)
+class GaussianNoise:
+    """Simple Gaussian noise for exploration"""
+    def __init__(self, action_dimension, sigma=0.15):
         self.action_dimension = action_dimension
-        self.mu = mu
-        self.theta = theta
         self.sigma = sigma
-        self.state = np.ones(self.action_dimension) * self.mu
-        self.reset()
         
     def reset(self):
-        self.state = np.ones(self.action_dimension) * self.mu
+        pass
         
     def sample(self):
-        x = self.state
-        dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(len(x))
-        self.state = x + dx
-        return self.state
+        return np.random.normal(0, self.sigma, self.action_dimension)
 
-# Actor network - simplified and optimized
+# Actor network - optimized architecture
 class Actor(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size=64):  # Reduced hidden size
+    def __init__(self, input_size, output_size, hidden_size=128):  # Larger network for better representation
         super(Actor, self).__init__()
         self.input_size = input_size
-        self.layer1 = nn.Linear(input_size, hidden_size)
-        self.layer2 = nn.Linear(hidden_size, hidden_size)
-        self.layer3 = nn.Linear(hidden_size, output_size)
         
-        # Better weight initialization
+        # Normalize inputs
+        self.bn_input = nn.BatchNorm1d(input_size)
+        
+        # Main network with more hidden units
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, output_size)
+        
+        # Better weight initialization - scaled for ELU activation
         self.apply(self._init_weights)
         
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, a=0.1)
+            # Initialize with He initialization (good for ELU/ReLU)
+            nn.init.kaiming_normal_(module.weight, a=0.1, nonlinearity='leaky_relu')
             if module.bias is not None:
                 module.bias.data.zero_()
         
@@ -79,41 +81,46 @@ class Actor(nn.Module):
             x = torch.FloatTensor(x)
             
         if x.dim() == 1:
-            x = x.unsqueeze(0)  # Add batch dimension if missing
+            x = x.unsqueeze(0)
             
-        # Check input dimensions
-        if x.size(1) != self.input_size:
-            raise ValueError(f"Expected input size {self.input_size}, got {x.size(1)}")
+        # BatchNorm handles single samples differently during training vs eval
+        training_mode = self.training and x.size(0) > 1
+        
+        # Use batch normalization conditionally
+        if x.size(0) > 1:
+            x = self.bn_input(x)
             
-        # Apply layers with leaky ReLU for better gradient flow
-        x = F.leaky_relu(self.layer1(x), 0.1)
-        x = F.leaky_relu(self.layer2(x), 0.1)
+        # Apply layers with ELU for better gradient flow
+        x = F.elu(self.fc1(x))
+        x = F.elu(self.fc2(x))
         
         # Output is tanh to bound actions between -1 and 1
-        return torch.tanh(self.layer3(x))
+        return torch.tanh(self.fc3(x))
 
-# Critic network - simplified and optimized
+# Critic network - optimized architecture with dual streams
 class Critic(nn.Module):
-    def __init__(self, state_size, action_size, hidden_size=64):  # Reduced hidden size
+    def __init__(self, state_size, action_size, hidden_size=128):
         super(Critic, self).__init__()
         self.state_size = state_size
         self.action_size = action_size
         
-        # Process state
+        # State path
+        self.bn_state = nn.BatchNorm1d(state_size)
         self.fc1 = nn.Linear(state_size, hidden_size)
         
-        # Combine state and action
+        # Combined path after state processing
         self.fc2 = nn.Linear(hidden_size + action_size, hidden_size)
-        
-        # Output Q-value
         self.fc3 = nn.Linear(hidden_size, 1)
+        
+        # Layer norm for hidden layers (more stable than batch norm for critic)
+        self.ln1 = nn.LayerNorm(hidden_size)
         
         # Better weight initialization
         self.apply(self._init_weights)
         
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, a=0.1)
+            nn.init.kaiming_normal_(module.weight, a=0.1, nonlinearity='leaky_relu')
             if module.bias is not None:
                 module.bias.data.zero_()
         
@@ -129,54 +136,106 @@ class Critic(nn.Module):
         if action.dim() == 1:
             action = action.unsqueeze(0)
             
-        # Check input dimensions
-        if state.size(1) != self.state_size:
-            raise ValueError(f"Expected state size {self.state_size}, got {state.size(1)}")
-        if action.size(1) != self.action_size:
-            raise ValueError(f"Expected action size {self.action_size}, got {action.size(1)}")
+        # Use batch normalization conditionally
+        if state.size(0) > 1:
+            state = self.bn_state(state)
             
-        # Process state
-        xs = F.leaky_relu(self.fc1(state), 0.1)
+        # Process state path
+        xs = F.elu(self.fc1(state))
+        xs = self.ln1(xs)  # Layer normalization
         
         # Combine state and action
         x = torch.cat([xs, action], dim=1)
-        x = F.leaky_relu(self.fc2(x), 0.1)
+        x = F.elu(self.fc2(x))
         
         # Output Q-value
         return self.fc3(x)
 
-# Replay Buffer with prioritized sampling
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.memory = deque([], maxlen=capacity)
-        self.priorities = deque([], maxlen=capacity)
-        self.alpha = 0.6  # Priority exponent
+# Improved Replay Buffer with N-step returns and prioritized experience replay
+class NStepPrioritizedReplayBuffer:
+    def __init__(self, capacity, n_steps=1, gamma=0.99, alpha=0.6, beta=0.4):
+        self.memory = deque(maxlen=capacity)
+        self.priorities = deque(maxlen=capacity)
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.alpha = alpha  # How much to prioritize
+        self.beta = beta    # Importance sampling weight
+        self.beta_increment = 0.001  # How much to increase beta over time
+        self.n_step_buffer = deque(maxlen=n_steps)
+        self.max_priority = 1.0
+        
+    def _get_n_step_info(self):
+        """Returns the n-step reward, next_state, and done"""
+        reward, next_state, done = self.n_step_buffer[-1][-3:]
+        
+        # Calculate n-step rewards
+        for i in range(len(self.n_step_buffer) - 1, 0, -1):
+            r, s, d = self.n_step_buffer[i-1][-3:]
+            reward = r + self.gamma * reward * (1 - d)
+            if d:
+                next_state = s
+                done = True
+                
+        return reward, next_state, done
 
-    def push(self, state, action, next_state, reward, done):
-        """Save a transition with maximum priority"""
-        max_priority = max(self.priorities, default=1.0)
-        self.memory.append(Transition(state, action, next_state, reward, done))
-        self.priorities.append(max_priority)
-
-    def sample(self, batch_size):
-        if len(self.memory) < batch_size:
-            return random.sample(self.memory, len(self.memory))
+    def add(self, state, action, reward, next_state, done):
+        """Add experience to n-step buffer"""
+        self.n_step_buffer.append((state, action, reward, next_state, done))
+        
+        if len(self.n_step_buffer) < self.n_steps:
+            return
             
+        # Get the n-step returns
+        if len(self.n_step_buffer) >= self.n_steps:
+            state, action = self.n_step_buffer[0][:2]
+            reward, next_state, done = self._get_n_step_info()
+            
+            # Add to memory with maximum priority
+            self.memory.append((state, action, reward, next_state, done))
+            self.priorities.append(self.max_priority)
+            
+    def sample(self, batch_size):
+        """Sample a batch of experiences with priorities"""
+        # Increase beta over time for annealing importance sampling bias
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        
         # Calculate sampling probabilities
-        priorities = np.array(self.priorities)
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
+        if len(self.memory) == batch_size:
+            indices = range(len(self.memory))
+        else:
+            priorities = np.array(self.priorities)
+            probabilities = priorities ** self.alpha
+            probabilities /= probabilities.sum()
+            
+            # Sample based on priorities
+            indices = np.random.choice(len(self.memory), batch_size, p=probabilities, replace=False)
         
-        # Sample based on priorities
-        indices = np.random.choice(len(self.memory), batch_size, p=probabilities)
-        samples = [self.memory[idx] for idx in indices]
+        # Calculate importance sampling weights
+        weights = []
+        p_min = min(self.priorities) / sum(self.priorities)
+        max_weight = (p_min * len(self.memory)) ** (-self.beta)
         
-        return samples
+        samples = []
+        for i in indices:
+            p_sample = self.priorities[i] / sum(self.priorities)
+            weight = (p_sample * len(self.memory)) ** (-self.beta)
+            weights.append(weight / max_weight)  # Normalize weights
+            
+            state, action, reward, next_state, done = self.memory[i]
+            samples.append(Transition(state, action, reward, next_state, done, i))
+            
+        return samples, np.array(weights, dtype=np.float32)
+    
+    def update_priorities(self, indices, priorities):
+        """Update priorities based on TD error"""
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority
+            self.max_priority = max(self.max_priority, priority)
 
     def __len__(self):
         return len(self.memory)
 
-# DDPG Agent with optimizations
+# DDPG Agent with further optimizations
 class DDPGAgent:
     def __init__(self, state_size, action_size, device):
         self.state_size = state_size
@@ -184,28 +243,58 @@ class DDPGAgent:
         self.device = device
         self.t_step = 0
         
+        # Use EMA (Exponential Moving Average) tracking for more stable learning
+        self.ema_reward = None
+        
         # Actor networks
         self.actor = Actor(state_size, action_size).to(device)
         self.actor_target = Actor(state_size, action_size).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
+        
+        # Use Adam with weight decay and custom parameters
+        self.actor_optimizer = optim.Adam(
+            self.actor.parameters(), 
+            lr=ACTOR_LR,
+            weight_decay=1e-5,
+            betas=(0.9, 0.999)
+        )
         
         # Critic networks
         self.critic = Critic(state_size, action_size).to(device)
         self.critic_target = Critic(state_size, action_size).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=CRITIC_LR, weight_decay=1e-4)  # Added weight decay
         
-        # Noise process for exploration with adaptive noise
-        self.noise = OUNoise(action_size, sigma=NOISE_SIGMA)
-        self.noise_scale = 1.0  # Will be annealed during training
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), 
+            lr=CRITIC_LR, 
+            weight_decay=1e-4,
+            betas=(0.9, 0.999)
+        )
         
-        # Memory
-        self.memory = ReplayBuffer(MEMORY_SIZE)
+        # Better noise process for exploration
+        self.noise = GaussianNoise(action_size, sigma=NOISE_SIGMA)
+        
+        # Memory with n-step returns and prioritization
+        self.memory = NStepPrioritizedReplayBuffer(
+            MEMORY_SIZE, 
+            n_steps=N_STEP_RETURNS, 
+            gamma=GAMMA,
+            alpha=PER_ALPHA,
+            beta=PER_BETA
+        )
         
         # Training stats
         self.actor_loss_history = []
         self.critic_loss_history = []
+        self.td_error_history = []
+        
+        # Adaptive learning rate scheduling
+        self.lr_scheduler_actor = optim.lr_scheduler.ReduceLROnPlateau(
+            self.actor_optimizer, mode='max', factor=0.5, patience=100, verbose=True
+        )
+        self.lr_scheduler_critic = optim.lr_scheduler.ReduceLROnPlateau(
+            self.critic_optimizer, mode='max', factor=0.5, patience=100, verbose=True
+        )
     
     def select_action(self, state, add_noise=True, noise_scale=1.0):
         # Convert state to tensor if it's not already
@@ -216,7 +305,7 @@ class DDPGAgent:
         if state.dim() == 1:
             state = state.unsqueeze(0)
         
-        # Verify state shape
+        # Check state shape
         if state.shape[1] != self.state_size:
             # Try to reshape or pad if needed
             if len(state.flatten()) >= self.state_size:
@@ -231,6 +320,7 @@ class DDPGAgent:
             action = self.actor(state).cpu().data.numpy()[0]
         self.actor.train()
         
+        # Add noise for exploration
         if add_noise:
             noise = self.noise.sample() * noise_scale
             action += noise
@@ -239,36 +329,47 @@ class DDPGAgent:
         return np.clip(action, -1.0, 1.0)
     
     def step(self, state, action, reward, next_state, done):
-        # Save experience in replay memory
-        self.memory.push(state, action, next_state, reward, done)
+        # Normalize rewards for more stable learning
+        if self.ema_reward is None:
+            self.ema_reward = reward
+        else:
+            self.ema_reward = 0.99 * self.ema_reward + 0.01 * reward
         
-        # Learn every UPDATE_EVERY time steps
+        # Add experience to replay buffer
+        self.memory.add(state, action, reward, next_state, done)
+        
+        # Learn every UPDATE_EVERY time steps if enough samples
         self.t_step = (self.t_step + 1) % UPDATE_EVERY
         if self.t_step == 0 and len(self.memory) > BATCH_SIZE:
-            experiences = self.memory.sample(BATCH_SIZE)
-            self.learn(experiences)
+            self.learn()
     
-    def learn(self, experiences):
-        batch = Transition(*zip(*experiences))
+    def learn(self):
+        # Sample from replay buffer
+        experiences, is_weights = self.memory.sample(BATCH_SIZE)
         
         # Convert to tensors
-        states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=self.device)
-        actions = torch.tensor(np.array(batch.action), dtype=torch.float32, device=self.device)
-        rewards = torch.tensor(np.array(batch.reward), dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=self.device)
-        dones = torch.tensor(np.array(batch.done), dtype=torch.float32, device=self.device).unsqueeze(1)
+        states = torch.tensor(np.array([e.state for e in experiences]), dtype=torch.float32, device=self.device)
+        actions = torch.tensor(np.array([e.action for e in experiences]), dtype=torch.float32, device=self.device)
+        rewards = torch.tensor(np.array([e.reward for e in experiences]), dtype=torch.float32, device=self.device).unsqueeze(1)
+        next_states = torch.tensor(np.array([e.next_state for e in experiences]), dtype=torch.float32, device=self.device)
+        dones = torch.tensor(np.array([e.done for e in experiences]), dtype=torch.float32, device=self.device).unsqueeze(1)
+        indices = np.array([e.priority for e in experiences])
+        is_weights = torch.tensor(is_weights, dtype=torch.float32, device=self.device).unsqueeze(1)
         
         # Update critic
         with torch.no_grad():
             next_actions = self.actor_target(next_states)
             Q_targets_next = self.critic_target(next_states, next_actions)
-            Q_targets = rewards + (GAMMA * Q_targets_next * (1 - dones))
+            Q_targets = rewards + (GAMMA**N_STEP_RETURNS) * Q_targets_next * (1 - dones)
             
         # Get expected Q values
         Q_expected = self.critic(states, actions)
         
-        # Compute critic loss - Huber loss for stability
-        critic_loss = F.smooth_l1_loss(Q_expected, Q_targets)
+        # Calculate TD errors for updating priorities
+        td_errors = torch.abs(Q_targets - Q_expected).detach().cpu().numpy()
+        
+        # Compute critic loss with importance sampling weights
+        critic_loss = (is_weights * F.smooth_l1_loss(Q_expected, Q_targets, reduction='none')).mean()
         
         # Minimize the loss
         self.critic_optimizer.zero_grad()
@@ -276,9 +377,9 @@ class DDPGAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1)  # Gradient clipping
         self.critic_optimizer.step()
         
-        # Update actor
+        # Update actor (delayed policy updates)
         actions_pred = self.actor(states)
-        actor_loss = -self.critic(states, actions_pred).mean()
+        actor_loss = -(is_weights * self.critic(states, actions_pred)).mean()
         
         # Minimize the loss
         self.actor_optimizer.zero_grad()
@@ -289,9 +390,13 @@ class DDPGAgent:
         # Update target networks
         self.soft_update_targets()
         
-        # Record loss
+        # Update priorities in replay buffer
+        self.memory.update_priorities(indices, td_errors.flatten() + 1e-5)  # small constant for stability
+        
+        # Record loss and TD error
         self.actor_loss_history.append(actor_loss.item())
         self.critic_loss_history.append(critic_loss.item())
+        self.td_error_history.append(np.mean(td_errors))
     
     def soft_update_targets(self):
         """Soft update target networks"""
@@ -308,6 +413,8 @@ class DDPGAgent:
             'critic_state_dict': self.critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'actor_lr_scheduler': self.lr_scheduler_actor.state_dict(),
+            'critic_lr_scheduler': self.lr_scheduler_critic.state_dict()
         }, filename)
     
     def load(self, filename):
@@ -318,6 +425,9 @@ class DDPGAgent:
         self.critic_target.load_state_dict(checkpoint['critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        if 'actor_lr_scheduler' in checkpoint:
+            self.lr_scheduler_actor.load_state_dict(checkpoint['actor_lr_scheduler'])
+            self.lr_scheduler_critic.load_state_dict(checkpoint['critic_lr_scheduler'])
 
 def simulate(learning=True, episode_start=0):
     # Set device
@@ -357,10 +467,15 @@ def simulate(learning=True, episode_start=0):
     # Enable rendering only for display episodes to improve performance
     env.set_view(False)
     
-    # Define noise annealing schedule
-    noise_start = 1.0
-    noise_end = 0.1
-    noise_decay = NUM_EPISODES / 2  # Decay over half the episodes
+    # Define noise annealing schedule - faster decay
+    noise_start = 0.8
+    noise_end = 0.05
+    noise_decay = NUM_EPISODES / 4  # Decay over quarter of the episodes
+    
+    # Early stopping variables
+    patience = 100
+    best_reward = -float('inf')
+    no_improvement_count = 0
     
     # Training loop
     for episode in range(episode_start, NUM_EPISODES + episode_start):
@@ -368,7 +483,7 @@ def simulate(learning=True, episode_start=0):
         state, _ = env.reset()
         agent.noise.reset()
         
-        # Set noise scale based on episode
+        # Set noise scale based on episode - exponential decay
         noise_scale = noise_end + (noise_start - noise_end) * math.exp(-1. * episode / noise_decay)
         
         # Enable rendering only for display episodes or play mode
@@ -413,35 +528,53 @@ def simulate(learning=True, episode_start=0):
                 episode_duration.append(t)
                 total_rewards.append(episode_reward)
                 
+                # Update learning rate schedulers
+                if learning:
+                    agent.lr_scheduler_actor.step(episode_reward)
+                    agent.lr_scheduler_critic.step(episode_reward)
+                
+                # Save best model
                 if episode_reward > max_reward: 
                     max_reward = episode_reward
                     if learning:
                         agent.save(f'models_{VERSION_NAME}/best_model.pth')
                 
+                # Early stopping logic
+                if episode_reward > best_reward:
+                    best_reward = episode_reward
+                    no_improvement_count = 0
+                else:
+                    no_improvement_count += 1
+                
                 print(f"Episode {episode} finished after {t} steps with reward {episode_reward:.1f}")
                 break
         
+        # Check for early stopping
+        if no_improvement_count >= patience:
+            print(f"Early stopping triggered after {episode} episodes due to no improvement")
+            break
+        
         # Save more frequently at the beginning, then less often
-        save_interval = REPORT_EPISODES if episode > 1000 else 100
+        save_interval = REPORT_EPISODES if episode > 1000 else 50
         if learning and episode > 0 and episode % save_interval == 0:
             # Save model
             agent.save(f'models_{VERSION_NAME}/ddpg_model_{episode}.pth')
             print(f"Model saved at episode {episode}")
             
             # Plot progress every few save points to reduce overhead
-            if episode % (save_interval * 5) == 0:
+            if episode % (save_interval * 2) == 0 or episode < 500:
                 plt.figure(figsize=(15, 10))
                 
                 # Plot rewards
                 plt.subplot(2, 2, 1)
-                plt.plot(total_rewards[-500:])  # Show only recent rewards for clarity
+                plt.plot(total_rewards[-300:])  # Show only recent rewards for clarity
                 plt.ylabel('rewards')
                 plt.xlabel('episode')
                 plt.title(f'Recent Training rewards - episode {episode}')
                 
                 # Plot episode duration
                 plt.subplot(2, 2, 2)
-                plt.plot(episode_duration[-500:])  # Show only recent durations
+                plt.plot(episode_duration[-300:])  # Show only recent durations
                 plt.ylabel('steps')
                 plt.xlabel('episode')
                 plt.title('Recent Episode durations')
@@ -454,12 +587,12 @@ def simulate(learning=True, episode_start=0):
                     plt.xlabel('optimization step')
                     plt.title('Actor Loss (last 1000 steps)')
                     
-                    # Plot critic loss
+                    # Plot TD errors
                     plt.subplot(2, 2, 4)
-                    plt.plot(agent.critic_loss_history[-1000:])
-                    plt.ylabel('critic loss')
+                    plt.plot(agent.td_error_history[-1000:])
+                    plt.ylabel('TD error')
                     plt.xlabel('optimization step')
-                    plt.title('Critic Loss (last 1000 steps)')
+                    plt.title('TD Error (last 1000 steps)')
                 
                 plt.tight_layout()
                 plt.savefig(f'models_{VERSION_NAME}/training_progress_{episode}.png')
